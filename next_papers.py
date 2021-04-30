@@ -1,5 +1,7 @@
 import numpy as np
+from ipdb import set_trace as st
 import time
+import logging
 from datetime import datetime
 import pybtex.database
 import os
@@ -7,11 +9,28 @@ import io
 import pdfplumber
 import urllib
 import xml
+import ratelimit
+
+# make it possible to just see meessages from this module
+LOGLEVEL = logging.INFO + 1
+
+
+# 20 seconds is a bit over cautious
+# arxiv.org/robots.txt calls for 15
+# then again, getting stfc servers banned
+# from making arXiv api calls would be embarising for NExT
+@ratelimit.sleep_and_retry
+@ratelimit.limits(calls=1, period=20)
+def request_url(url):
+    """To ratelimit requests """
+    logging.log(LOGLEVEL, f"Fetching {url}")
+    data = urllib.request.urlopen(url).read()
+    return data
 
 
 def get_paper_pdf(arxiv_id):
     url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-    data = urllib.request.urlopen(url).read()
+    data = request_url(url)
     io_bytes = io.BytesIO(data)
     pdf_object = pdfplumber.open(io_bytes)
     return pdf_object
@@ -21,10 +40,15 @@ def check_pdf_for_next(pdf_object):
     # acknowldgments are normally at the end so work backwards
     text = ""
     for page in pdf_object.pages[::-1]:
+        previous_page = page.extract_text()
+        if previous_page is None:
+            continue
         previous_page = alpha_only(page.extract_text())
         text = previous_page + " " + text
         if check_text_is_next(text):
             return True
+    if len(text.strip()) == 0:
+        logging.warning("PDF appears empty")
     return False
 
 
@@ -55,8 +79,14 @@ def check_text_is_next(clean_text):
         # but ignore spacing
         institute_string = "NExTInstitute"
         clean_text = clean_text.replace(" ", "")
-        return institute_string in clean_text
-    return next_string in clean_text[start_acknowldgments:]
+        next_string = institute_string
+        start_acknowldgments = 0
+    is_next = next_string in clean_text[start_acknowldgments:]
+    if is_next:
+        location = clean_text.find(next_string)
+        context = clean_text[max(location - 20, 0): location + 30]
+        logging.log(LOGLEVEL, f'Classified as NExT due to; "{context}"')
+    return is_next
 
 
 def check_is_next(arxiv_id):
@@ -97,6 +127,10 @@ class KnownAuthors:
                           f"found in line\n{line}\n" + \
                           "fix {self.file_path} and run again"
                     raise ValueError(msg)
+        logging.log(LOGLEVEL, f"In file {self.file_path} found " +
+                     f"{len(self.is_next)} confirmed NExT authors, " +
+                     f"{len(self.maybe_next)} possible NExT authors, " +
+                     f"{len(self.not_next)} non-NExT authors, ")
 
     def save(self):
         """Write the authors to disk """
@@ -110,15 +144,16 @@ class KnownAuthors:
         maybe_suffix = f" {self.field_sep} maybe\n"
         for name in self.maybe_next:
             text += name + maybe_suffix
-            
         with open(self.file_path, 'w') as file_obj:
             file_obj.write(text)
+        logging.log(LOGLEVEL, f"Written authors to {self.file_path}")
 
     def add_author(self, name, membership="maybe"):
         """We only use a name becuase no other field is garenteed to be consistant
         Overscanning shouldn't be too much of an issue"""
         membership = membership.lower()
-        name = name.strip()
+        initial, last = get_initial_last(name)
+        name = f"{initial}. {last}" if initial is not None else last
         # remove it from maybe
         self.maybe_next.discard(name)
         if "no" in membership:
@@ -142,8 +177,10 @@ class KnownPapers:
     def __init__(self, file_is_next, file_not_next):
         self.file_is_next, self.is_next, self.ids_is_next = \
                 self.__setup(file_is_next)
+        logging.log(LOGLEVEL, f"In {file_is_next} found {len(self.is_next.entries)} items")
         self.file_not_next, self.not_next, self.ids_not_next = \
                 self.__setup(file_not_next)
+        logging.log(LOGLEVEL, f"In {file_not_next} found {len(self.not_next.entries)} items")
 
     def __setup(self, file_path):
         assert file_path.endswith(".bib"),\
@@ -151,7 +188,7 @@ class KnownPapers:
         ids = {}  # key is arxiv id, value is bib key
         if os.path.exists(file_path):
             bib_data = pybtex.database.parse_file(file_path)
-            for key, entry in bib_data.items():
+            for key, entry in bib_data.entries.items():
                 arxiv_id = entry.fields['eprint'].split('v')[0]
                 ids[arxiv_id] = key
         else:
@@ -162,44 +199,112 @@ class KnownPapers:
         self.is_next.to_file(self.file_is_next)
         self.not_next.to_file(self.file_not_next)
 
-    def add_paper(self, key, bib_entry):
+    def update_paper(self, arxiv_id, new_entry, in_next):
+        logging.log(LOGLEVEL, f"{arxiv_id} recognised")
+        if in_next:
+            bib_object = self.is_next
+            key = self.ids_is_next[arxiv_id]
+        else:
+            bib_object = self.not_next
+            key = self.ids_not_next[arxiv_id]
+        existing_date = bib_object.entries[key].fields["last_update"]
+        existing_date = datetime.fromisoformat(existing_date)
+        new_date = new_entry.fields["last_update"]
+        new_date = datetime.fromisoformat(new_date)
+        if new_date > existing_date:
+            logging.log(LOGLEVEL, f"Found update for {arxiv_id}")
+            bib_object.entries[key] = new_entry
+
+    def add_paper(self, bib_entry):
         arxiv_id = bib_entry.fields['eprint'].split('v')[0]
         # check if we have it
         if arxiv_id in self.ids_is_next:
-            # update
-            key = self.ids_is_next[arxiv_id]
-            self.is_next.entries[key] = bib_entry
             next_paper = True
+            self.update_paper(arxiv_id, bib_entry, next_paper)
         elif arxiv_id in self.ids_not_next:
-            # update
-            key = self.ids_not_next[arxiv_id]
-            self.not_next.entries[key] = bib_entry
             next_paper = False
+            self.update_paper(arxiv_id, bib_entry, next_paper)
         else:  # new entry
-            next_paper = check_is_next(arxiv_id)
+            try:
+                next_paper = check_is_next(arxiv_id)
+            except pdfplumber.pdfminer.pdfparser.PDFSyntaxError:
+                logging.warning(f"Failed to get PDF for {arxiv_id}")
+                return False
+            key = make_bib_key(bib_entry)
             if next_paper:
+                logging.log(LOGLEVEL, f"Added {arxiv_id} as NExT")
+                self.ids_is_next[arxiv_id] = key
                 self.is_next.add_entry(key, bib_entry)
             else:
+                logging.log(LOGLEVEL, f"{arxiv_id} is not NExT")
+                self.ids_not_next[arxiv_id] = key
                 self.not_next.add_entry(key, bib_entry)
         return next_paper
 
 
-def check_for_papers(known_papers, known_authors, author, start_date):
-    author = author.replace(" ", "+")
-    query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=ascending&start="
+def get_initial_last(name):
+    name = name.replace('.', ' ')
+    *first, last = name.split()
+    if len(first):
+        initial = first[0][0]
+    else:
+        initial = None
+    return initial, last
+
+
+def check_for_papers(prefix="./"):
+    log_file = prefix + str(datetime.today().date()) + ".log"
+    logging.basicConfig(filename=log_file, level=LOGLEVEL)
+    print("To follow progress do \n" + 
+          f" >> tail -f {log_file}")
+
+    date_file = prefix + "last_run.txt"
+    if os.path.exists(date_file):
+        with open(date_file, 'r') as date_f:
+            start_date = date_f.read().strip()
+    else:
+        start_date = "2021-04-01"
+    logging.log(LOGLEVEL, f"Checking back to date={start_date}")
+    start_date = datetime.fromisoformat(start_date)
+
+    authors_file = prefix + "authors.txt"
+    known_authors = KnownAuthors(authors_file)
+    if len(known_authors.is_next) == 0:
+        raise ValueError(f"No NExT authors in {authors_file}")
+
+    is_next_bib_file = prefix + "is_NExT.bib"
+    not_next_bib_file = prefix + "not_NExT.bib"
+    known_papers = KnownPapers(is_next_bib_file, not_next_bib_file)
+
+    for author in known_authors.is_next:
+        logging.log(LOGLEVEL, f"Checking author {author}")
+        check_author_name(known_papers, known_authors, author, start_date)
+
+    with open(date_file, 'w') as date_f:
+        date_f.write(str(datetime.today().date()))
+    known_papers.save()
+    known_authors.save()
+    logging.log(LOGLEVEL, f"Done")
+
+
+def check_author_name(known_papers, known_authors, author, start_date):
+    # author names tend to be given "first last"
+    # for a search string we need last,&first
+    initial, last = get_initial_last(author)
+    author = f"{last},&{initial}" if initial is not None else last
+    query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=descending&start="
     page = 0
     while True:
-        xml_string = urllib.request.urlopen(query + str(page)).read()
+        xml_string = request_url(query + str(page))
         xml_tree = xml.etree.ElementTree.fromstring(xml_string)
         for part in xml_tree:
             if part.tag.endswith("entry"):
-                key, bib_entry, last_update, authors = xml_entry_to_bib(part)
-                known_papers.add_paper(key, bib_entry)
-                for author in authors:
-                    known_authors.add_author(author)
+                bib_entry, last_update, paper_authors = xml_entry_to_bib(part)
+                known_papers.add_paper(bib_entry)
+                for paper_author in paper_authors:
+                    known_authors.add_author(paper_author)
         if last_update < start_date:
             return
-        time.sleep(3)  # wait 3 seconds before next request
         page += 1
 
 
@@ -211,14 +316,18 @@ def xml_entry_to_bib(xml_entry):
         if tag == "id":
             url = part.text
             bib_fields["url"] = url
-            bib_fields["eprint"] = url.split("/")[-1]
+            bib_fields["eprint"] = url.split("/abs/")[-1]
         elif tag == "title":
+            logging.log(LOGLEVEL, f'Paper title "{part.text}"')
             bib_fields["title"] = part.text
         elif tag == "author":
             for subpart in part:
-                authors.append(subpart.text)
+                if subpart.tag.endswith("name"):
+                    authors.append(subpart.text)
         elif tag == "updated":
             last_update = datetime.fromisoformat(part.text[:-1])
+            # this isn't really a field but adding it should break anything
+            bib_fields["last_update"] = part.text[:-1]
         elif tag == "published":  # this is the date we care about
             date = part.text
             year, month, _ = date.split('-')
@@ -232,12 +341,19 @@ def xml_entry_to_bib(xml_entry):
             # this information appears to be a mix of
             # journal, pages and volume
             bib_fields["journal"] = part.text
-    key = ''.join(list(filter(lambda c: c.isalpha(), authors[0]))) + \
-            ":" + bib_fields["year"] + bib_fields["Title"].strip()[:5]
-    bib_persons = {'author': authors}
+    bib_persons = {'author': [pybtex.database.Person(author)
+                              for author in authors]}
     bib_entry = pybtex.database.Entry("paper", bib_fields, bib_persons)
-    return key, bib_entry, last_update, authors
-                
+    return bib_entry, last_update, authors
+
+
+def make_bib_key(bib_entry):
+    fields = bib_entry.fields
+    author = bib_entry.persons['author'][0].last()[-1]
+    author = ''.join(list(filter(lambda c: c.isalpha(), author)))
+    title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
+    key = f'{author}:{fields["year"]}+{title[:5]}'
+    return key
 
 ## don't use these..... arXiv robot.txt forbits downloading e-prints.
 #import gzip
