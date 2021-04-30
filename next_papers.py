@@ -1,5 +1,4 @@
 import numpy as np
-from ipdb import set_trace as st
 import time
 import logging
 from datetime import datetime
@@ -95,6 +94,16 @@ def check_is_next(arxiv_id):
     return check_pdf_for_next(pdf_object)
 
 
+def get_initial_last(name):
+    name = name.replace('.', ' ')
+    *first, last = name.split()
+    if len(first):
+        initial = first[0][0]
+    else:
+        initial = None
+    return initial, last
+
+
 class KnownAuthors:
     """Keep track of authors we have seen"""
     field_sep = "#"
@@ -104,6 +113,7 @@ class KnownAuthors:
         self.is_next = set()
         self.not_next = set()
         self.maybe_next = set()
+        self.new = set()
         if os.path.exists(file_path):
             self.__parse_file()
 
@@ -159,7 +169,11 @@ class KnownAuthors:
         if "no" in membership:
             self.not_next.add(name)
             self.is_next.discard(name)
-        elif "yes" in membership or "is" in membership:
+            return
+        # check if it's new
+        if name not in self.not_next.union(self.pottential_next):
+            self.new.add(name)
+        if "yes" in membership or "is" in membership:
             self.is_next.add(name)
             self.not_next.discard(name)
         elif "maybe" in membership:
@@ -170,6 +184,58 @@ class KnownAuthors:
             msg = f"Cant understand membership status {membership}\n" +\
                    " expected 'yes', 'no' or 'maybe'"
             raise ValueError(msg)
+
+    @property
+    def pottential_next(self):
+        return self.is_next.union(self.maybe_next)
+
+
+def xml_entry_to_bib(xml_entry):
+    bib_fields = {"archivePrefix": "arXiv"}
+    authors = []
+    for part in xml_entry:
+        tag = part.tag.split("}")[-1]
+        if tag == "id":
+            url = part.text
+            bib_fields["url"] = url
+            bib_fields["eprint"] = url.split("/abs/")[-1]
+        elif tag == "title":
+            logging.log(LOGLEVEL, f'Paper title "{part.text}"')
+            bib_fields["title"] = part.text
+        elif tag == "author":
+            for subpart in part:
+                if subpart.tag.endswith("name"):
+                    authors.append(subpart.text)
+        elif tag == "updated":
+            last_update = datetime.fromisoformat(part.text[:-1])
+            # this isn't really a field but adding it should break anything
+            bib_fields["last_update"] = part.text[:-1]
+        elif tag == "published":  # this is the date we care about
+            date = part.text
+            year, month, _ = date.split('-')
+            bib_fields["year"] = year
+            bib_fields["month"] = month
+        elif tag == "summary":
+            bib_fields["abstract"] = part.text
+        elif tag == "doi":
+            bib_fields["doi"] = part.text
+        elif tag == "journal_ref":
+            # this information appears to be a mix of
+            # journal, pages and volume
+            bib_fields["journal"] = part.text
+    bib_persons = {'author': [pybtex.database.Person(author)
+                              for author in authors]}
+    bib_entry = pybtex.database.Entry("paper", bib_fields, bib_persons)
+    return bib_entry, last_update, authors
+
+
+def make_bib_key(bib_entry):
+    fields = bib_entry.fields
+    author = bib_entry.persons['author'][0].last()[-1]
+    author = ''.join(list(filter(lambda c: c.isalpha(), author)))
+    title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
+    key = f'{author}:{fields["year"]}+{title[:5]}'
+    return key
 
 
 class KnownPapers:
@@ -242,16 +308,29 @@ class KnownPapers:
         return next_paper
 
 
-def get_initial_last(name):
-    name = name.replace('.', ' ')
-    *first, last = name.split()
-    if len(first):
-        initial = first[0][0]
-    else:
-        initial = None
-    return initial, last
+def check_author_name(known_papers, known_authors, author, start_date):
+    # author names tend to be given "first last"
+    # for a search string we need last,&first
+    initial, last = get_initial_last(author)
+    author = f"{last},&{initial}" if initial is not None else last
+    query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=descending&start="
+    page = 0
+    while True:
+        xml_string = request_url(query + str(page))
+        xml_tree = xml.etree.ElementTree.fromstring(xml_string)
+        for part in xml_tree:
+            if part.tag.endswith("entry"):
+                bib_entry, last_update, paper_authors = xml_entry_to_bib(part)
+                is_next = known_papers.add_paper(bib_entry)
+                if is_next:
+                    for paper_author in paper_authors:
+                        known_authors.add_author(paper_author)
+        if last_update < start_date:
+            return
+        page += 1
 
 
+# entry point!
 def check_for_papers(prefix="./"):
     log_file = prefix + str(datetime.today().date()) + ".log"
     logging.basicConfig(filename=log_file, level=LOGLEVEL)
@@ -269,15 +348,21 @@ def check_for_papers(prefix="./"):
 
     authors_file = prefix + "authors.txt"
     known_authors = KnownAuthors(authors_file)
-    if len(known_authors.is_next) == 0:
+    if len(known_authors.pottential_next) == 0:
         raise ValueError(f"No NExT authors in {authors_file}")
 
     is_next_bib_file = prefix + "is_NExT.bib"
     not_next_bib_file = prefix + "not_NExT.bib"
     known_papers = KnownPapers(is_next_bib_file, not_next_bib_file)
 
-    for author in known_authors.is_next:
+    logging.log(LOGLEVEL, "Checking existing authors")
+    for author in known_authors.pottential_next:
         logging.log(LOGLEVEL, f"Checking author {author}")
+        check_author_name(known_papers, known_authors, author, start_date)
+    logging.log(LOGLEVEL, "Checking {len(known_authors.new)} new authors")
+    while known_authors.new:
+        author = known_authors.new.pop()
+        logging.log(LOGLEVEL, f"Checking new author {author}")
         check_author_name(known_papers, known_authors, author, start_date)
 
     with open(date_file, 'w') as date_f:
@@ -287,73 +372,8 @@ def check_for_papers(prefix="./"):
     logging.log(LOGLEVEL, f"Done")
 
 
-def check_author_name(known_papers, known_authors, author, start_date):
-    # author names tend to be given "first last"
-    # for a search string we need last,&first
-    initial, last = get_initial_last(author)
-    author = f"{last},&{initial}" if initial is not None else last
-    query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=descending&start="
-    page = 0
-    while True:
-        xml_string = request_url(query + str(page))
-        xml_tree = xml.etree.ElementTree.fromstring(xml_string)
-        for part in xml_tree:
-            if part.tag.endswith("entry"):
-                bib_entry, last_update, paper_authors = xml_entry_to_bib(part)
-                known_papers.add_paper(bib_entry)
-                for paper_author in paper_authors:
-                    known_authors.add_author(paper_author)
-        if last_update < start_date:
-            return
-        page += 1
-
-
-def xml_entry_to_bib(xml_entry):
-    bib_fields = {"archivePrefix": "arXiv"}
-    authors = []
-    for part in xml_entry:
-        tag = part.tag.split("}")[-1]
-        if tag == "id":
-            url = part.text
-            bib_fields["url"] = url
-            bib_fields["eprint"] = url.split("/abs/")[-1]
-        elif tag == "title":
-            logging.log(LOGLEVEL, f'Paper title "{part.text}"')
-            bib_fields["title"] = part.text
-        elif tag == "author":
-            for subpart in part:
-                if subpart.tag.endswith("name"):
-                    authors.append(subpart.text)
-        elif tag == "updated":
-            last_update = datetime.fromisoformat(part.text[:-1])
-            # this isn't really a field but adding it should break anything
-            bib_fields["last_update"] = part.text[:-1]
-        elif tag == "published":  # this is the date we care about
-            date = part.text
-            year, month, _ = date.split('-')
-            bib_fields["year"] = year
-            bib_fields["month"] = month
-        elif tag == "summary":
-            bib_fields["abstract"] = part.text
-        elif tag == "doi":
-            bib_fields["doi"] = part.text
-        elif tag == "journal_ref":
-            # this information appears to be a mix of
-            # journal, pages and volume
-            bib_fields["journal"] = part.text
-    bib_persons = {'author': [pybtex.database.Person(author)
-                              for author in authors]}
-    bib_entry = pybtex.database.Entry("paper", bib_fields, bib_persons)
-    return bib_entry, last_update, authors
-
-
-def make_bib_key(bib_entry):
-    fields = bib_entry.fields
-    author = bib_entry.persons['author'][0].last()[-1]
-    author = ''.join(list(filter(lambda c: c.isalpha(), author)))
-    title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
-    key = f'{author}:{fields["year"]}+{title[:5]}'
-    return key
+if __name__ == "__main__":
+    check_for_papers()
 
 ## don't use these..... arXiv robot.txt forbits downloading e-prints.
 #import gzip
