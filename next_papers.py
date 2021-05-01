@@ -1,5 +1,5 @@
-import numpy as np
 import time
+import unicodedata
 import logging
 from datetime import datetime
 import pybtex.database
@@ -9,6 +9,7 @@ import pdfplumber
 import urllib
 import xml
 import ratelimit
+#from ipdb import set_trace as st
 
 # make it possible to just see meessages from this module
 LOGLEVEL = logging.INFO + 1
@@ -22,6 +23,8 @@ LOGLEVEL = logging.INFO + 1
 @ratelimit.limits(calls=1, period=20)
 def request_url(url):
     """To ratelimit requests """
+    # need to remove and extended ascii
+    url = unicodedata.normalize("NFKD", url).encode("ascii", "ignore").decode()
     logging.log(LOGLEVEL, f"Fetching {url}")
     data = urllib.request.urlopen(url).read()
     return data
@@ -131,7 +134,7 @@ class KnownAuthors:
                     raise ValueError(msg)
                 name, membership = line.split(self.field_sep)
                 try:
-                    self.add_author(name, membership)
+                    self.add_author(name, membership, new=False)
                 except ValueError as e:
                     msg = str(e) + \
                           f"found in line\n{line}\n" + \
@@ -158,24 +161,25 @@ class KnownAuthors:
             file_obj.write(text)
         logging.log(LOGLEVEL, f"Written authors to {self.file_path}")
 
-    def add_author(self, name, membership="maybe"):
+    def add_author(self, name, membership="maybe", new=True):
         """We only use a name becuase no other field is garenteed to be consistant
         Overscanning shouldn't be too much of an issue"""
         membership = membership.lower()
         initial, last = get_initial_last(name)
         name = f"{initial}. {last}" if initial is not None else last
         # remove it from maybe
-        self.maybe_next.discard(name)
         if "no" in membership:
             self.not_next.add(name)
             self.is_next.discard(name)
+            self.maybe_next.discard(name)
             return
         # check if it's new
-        if name not in self.not_next.union(self.pottential_next):
+        if new and name not in self.not_next.union(self.pottential_next):
             self.new.add(name)
         if "yes" in membership or "is" in membership:
             self.is_next.add(name)
             self.not_next.discard(name)
+            self.maybe_next.discard(name)
         elif "maybe" in membership:
             # only maybe if we don't have better info
             if name not in self.is_next and name not in self.not_next:
@@ -232,9 +236,11 @@ def xml_entry_to_bib(xml_entry):
 def make_bib_key(bib_entry):
     fields = bib_entry.fields
     author = bib_entry.persons['author'][0].last()[-1]
+    if author.lower() == "collaboration":
+        author = bib_entry.persons['author'][0].first()[-1]
     author = ''.join(list(filter(lambda c: c.isalpha(), author)))
-    title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
-    key = f'{author}:{fields["year"]}+{title[:5]}'
+    #title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
+    key = f'{author}:{fields["year"]}:{fields["eprint"]}'
     return key
 
 
@@ -264,6 +270,7 @@ class KnownPapers:
     def save(self):
         self.is_next.to_file(self.file_is_next)
         self.not_next.to_file(self.file_not_next)
+        logging.log(LOGLEVEL, f"Written bibs to {self.file_is_next} and {self.file_not_next}")
 
     def update_paper(self, arxiv_id, new_entry, in_next):
         logging.log(LOGLEVEL, f"{arxiv_id} recognised")
@@ -296,6 +303,10 @@ class KnownPapers:
             except pdfplumber.pdfminer.pdfparser.PDFSyntaxError:
                 logging.warning(f"Failed to get PDF for {arxiv_id}")
                 return False
+            except Exception as e:
+                logging.warning(f"Unknown error in PDF {arxiv_id}")
+                logging.warning(str(e))
+                return False
             key = make_bib_key(bib_entry)
             if next_paper:
                 logging.log(LOGLEVEL, f"Added {arxiv_id} as NExT")
@@ -315,18 +326,27 @@ def check_author_name(known_papers, known_authors, author, start_date):
     author = f"{last},&{initial}" if initial is not None else last
     query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=descending&start="
     page = 0
-    while True:
+    # willing to check 3 pages of results before giving up on this author
+    patience = 3
+    page_without_next = 0 
+    while page_without_next < patience:
         xml_string = request_url(query + str(page))
         xml_tree = xml.etree.ElementTree.fromstring(xml_string)
+        page_without_next += 1
+        has_entry = False
         for part in xml_tree:
             if part.tag.endswith("entry"):
+                has_entry = True
                 bib_entry, last_update, paper_authors = xml_entry_to_bib(part)
                 is_next = known_papers.add_paper(bib_entry)
                 if is_next:
+                    page_without_next = 0
                     for paper_author in paper_authors:
                         known_authors.add_author(paper_author)
-        if last_update < start_date:
-            return
+                if last_update < start_date:
+                    return
+        if not has_entry:
+            break  # if there was nothing on this page stop checking
         page += 1
 
 
@@ -334,7 +354,7 @@ def check_author_name(known_papers, known_authors, author, start_date):
 def check_for_papers(prefix="./"):
     log_file = prefix + str(datetime.today().date()) + ".log"
     logging.basicConfig(filename=log_file, level=LOGLEVEL)
-    print("To follow progress do \n" + 
+    print("To follow progress do \n" +
           f" >> tail -f {log_file}")
 
     date_file = prefix + "last_run.txt"
@@ -356,24 +376,32 @@ def check_for_papers(prefix="./"):
     known_papers = KnownPapers(is_next_bib_file, not_next_bib_file)
 
     logging.log(LOGLEVEL, "Checking existing authors")
-    for author in known_authors.pottential_next:
+    save_interval = 5
+    for i, author in enumerate(known_authors.pottential_next):
         logging.log(LOGLEVEL, f"Checking author {author}")
         check_author_name(known_papers, known_authors, author, start_date)
-    logging.log(LOGLEVEL, "Checking {len(known_authors.new)} new authors")
+        if i % save_interval == 0:
+            known_papers.save()
+            known_authors.save()
+    logging.log(LOGLEVEL, f"Checking {len(known_authors.new)} new authors")
     while known_authors.new:
         author = known_authors.new.pop()
         logging.log(LOGLEVEL, f"Checking new author {author}")
         check_author_name(known_papers, known_authors, author, start_date)
+        i += 1
+        if i % save_interval == 0:
+            known_papers.save()
+            known_authors.save()
 
     with open(date_file, 'w') as date_f:
         date_f.write(str(datetime.today().date()))
     known_papers.save()
     known_authors.save()
-    logging.log(LOGLEVEL, f"Done")
+    logging.log(LOGLEVEL, "Done")
 
 
-if __name__ == "__main__":
-    check_for_papers()
+#if __name__ == "__main__":
+#    check_for_papers()
 
 ## don't use these..... arXiv robot.txt forbits downloading e-prints.
 #import gzip
