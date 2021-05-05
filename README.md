@@ -1,4 +1,4 @@
-![Travis (.org)](https://img.shields.io/HenryDayHall/next_paper_hunter)
+![Travis (.org)](https://img.shields.io/travis/HenryDayHall/next_paper_hunter)
 ![Codecov](https://img.shields.io/codecov/c/gh/HenryDayHall/next_paper_hunter)
 # NExT paper finder
 
