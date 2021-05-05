@@ -1,0 +1,7 @@
+# required python packages, installed by pip3
+# could probably relax the version requirements
+# works under python 3.6.9
+ipdb >= 0.12.3
+pdfplumber >= 0.5.27
+ratelimit >= 2.2.1
+numpy >= 1.19.2
