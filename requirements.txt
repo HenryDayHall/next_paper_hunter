@@ -5,3 +5,4 @@ ipdb >= 0.12.3
 pdfplumber >= 0.5.27
 ratelimit >= 2.2.1
 numpy >= 1.19.2
+datetime
