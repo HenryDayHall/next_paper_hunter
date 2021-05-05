@@ -31,7 +31,7 @@ def test_requesturl():
                  for line in data2.split(os.linesep)
                  if line.startswith(line_start))
     time2 = datetime.datetime.fromisoformat(time2)
-    wait = datetime.timedelta(seconds=20)
+    wait = datetime.timedelta(seconds=19)
     assert time2 - time1 >= wait, f"Wait was {time2 - time1}"
 
 
@@ -95,4 +95,10 @@ def test_month_to_numeric():
     assert tools.month_to_numeric(inp) == "12"
     inp = "dec"
     assert tools.month_to_numeric(inp) == "12"
+
+def test_check_braces_match():
+    assert tools.check_braces_match("") == 0
+    assert tools.check_braces_match("{}") == 0
+    assert tools.check_braces_match("\\{}") == -1
+    assert tools.check_braces_match("{{}") == 1
 

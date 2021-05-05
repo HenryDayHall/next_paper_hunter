@@ -1,4 +1,5 @@
 import logging
+from ipdb import set_trace as st
 from datetime import datetime
 import os
 import io
@@ -210,7 +211,12 @@ class KnownPapers:
         if os.path.exists(file_path):
             bib_data = latex_bib.Bibliography(file_path)
             for key, entry in bib_data.items():
-                arxiv_id = entry.fields['eprint'].split('v')[0]
+                try:
+                    arxiv_id = entry.fields['eprint'].split('v')[0]
+                except KeyError as err:
+                    msg = f"Couldn't find 'eprint' in entry {key}\n" + \
+                          f"Has fields;\n{entry.fields.keys()}"
+                    raise ValueError(msg) from err
                 ids[arxiv_id] = key
         else:
             bib_data = latex_bib.Bibliography()
@@ -235,7 +241,8 @@ class KnownPapers:
         new_date = datetime.fromisoformat(new_date)
         if new_date > existing_date:
             logging.log(LOGLEVEL, f"Found update for {arxiv_id}")
-            bib_object[key] = new_entry
+            bib_object.change_key(key, new_entry.key)
+            bib_object[new_entry.key] = new_entry
 
     def add_paper(self, bib_entry):
         arxiv_id = bib_entry.fields['eprint'].split('v')[0]

@@ -36,17 +36,15 @@ def read_sample():
 
 def test_split_bib():
     bib_string = read_sample()
-    bib_strings = latex_bib.split_bib(bib_string)
-    assert len(bib_strings) == 2
-    for string in bib_strings:
-        assert string[0] == '@'
-        assert '=' in string
-        # should be possible to make into a bib_entry
-        latex_bib.BibEntry(bib_string)
+    bib_entries = latex_bib.split_bib(bib_string)
+    assert len(bib_entries) == 2
+    for bib_entry in bib_entries:
+        assert isinstance(bib_entry, latex_bib.BibEntry)
+        assert len(bib_entry.fields) > 1
 
 
 def test_get_bib_entry_key():
-    bib_strings = latex_bib.split_bib(read_sample())
+    bib_strings = [str(e) for e in latex_bib.split_bib(read_sample())]
     key = "Gallicchio_2010"
     assert latex_bib.get_bib_entry_key(bib_strings[0]) == key
     key = "chakraborty2020revisiting"
@@ -54,9 +52,9 @@ def test_get_bib_entry_key():
 
 
 def test_read_bib_entry():
-    bib_strings = latex_bib.split_bib(read_sample())
+    bib_entries = read_sample()
     
-    entry_type, entry_key, fields = latex_bib.read_bib_entry(bib_strings[0])
+    entry_type, entry_key, fields, end = latex_bib.read_bib_entry(bib_entries)
     assert entry_key == "Gallicchio_2010"
     assert entry_type == "Article"
     
@@ -76,7 +74,7 @@ def test_read_bib_entry():
         assert fields[key] == expected_fields[key], \
             f"fields[{key}]={fields[key]} but expected {expected_fields[key]}"
 
-    entry_type, entry_key, fields = latex_bib.read_bib_entry(bib_strings[1])
+    entry_type, entry_key, fields, end = latex_bib.read_bib_entry(bib_entries[end:])
     assert entry_key == "chakraborty2020revisiting"
     assert entry_type == "Misc"
 
@@ -176,10 +174,9 @@ def test_BibEntry():
     bib_string = read_sample()
 
     keys = ["chakraborty2020revisiting", "Gallicchio_2010"]
-    for entry_string in latex_bib.split_bib(bib_string):
-        entry = latex_bib.BibEntry(entry_string)
+    for entry in latex_bib.split_bib(bib_string):
         assert entry.key in keys
-        alt = latex_bib.BibEntry(entry_string, key="Frodo",
+        alt = latex_bib.BibEntry(str(entry), key="Frodo",
                                  entry_type="Hobbit")
         assert alt.key == "Frodo"
         assert alt.entry_type == "Hobbit"
