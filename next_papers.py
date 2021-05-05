@@ -1,38 +1,17 @@
-import time
-import unicodedata
 import logging
 from datetime import datetime
-import pybtex.database
 import os
 import io
-import pdfplumber
-import urllib
 import xml
-import ratelimit
-#from ipdb import set_trace as st
-
-# make it possible to just see meessages from this module
-LOGLEVEL = logging.INFO + 1
-
-
-# 20 seconds is a bit over cautious
-# arxiv.org/robots.txt calls for 15
-# then again, getting stfc servers banned
-# from making arXiv api calls would be embarising for NExT
-@ratelimit.sleep_and_retry
-@ratelimit.limits(calls=1, period=20)
-def request_url(url):
-    """To ratelimit requests """
-    # need to remove and extended ascii
-    url = unicodedata.normalize("NFKD", url).encode("ascii", "ignore").decode()
-    logging.log(LOGLEVEL, f"Fetching {url}")
-    data = urllib.request.urlopen(url).read()
-    return data
+import pdfplumber
+import latex_bib
+import tools
+from tools import LOGLEVEL
 
 
 def get_paper_pdf(arxiv_id):
     url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-    data = request_url(url)
+    data = tools.request_url(url)
     io_bytes = io.BytesIO(data)
     pdf_object = pdfplumber.open(io_bytes)
     return pdf_object
@@ -45,21 +24,13 @@ def check_pdf_for_next(pdf_object):
         previous_page = page.extract_text()
         if previous_page is None:
             continue
-        previous_page = alpha_only(page.extract_text())
+        previous_page = tools.alpha_only(page.extract_text())
         text = previous_page + " " + text
         if check_text_is_next(text):
             return True
     if len(text.strip()) == 0:
         logging.warning("PDF appears empty")
     return False
-
-
-def alpha_only(text):
-    """Given a string return a
-    string with only alphabetical charicters and spaces"""
-    text = [c if c.isalpha() else " " for c in text]
-    text = ''.join(text)
-    return text
 
 
 def check_text_is_next(clean_text):
@@ -97,16 +68,6 @@ def check_is_next(arxiv_id):
     return check_pdf_for_next(pdf_object)
 
 
-def get_initial_last(name):
-    name = name.replace('.', ' ')
-    *first, last = name.split()
-    if len(first):
-        initial = first[0][0]
-    else:
-        initial = None
-    return initial, last
-
-
 class KnownAuthors:
     """Keep track of authors we have seen"""
     field_sep = "#"
@@ -141,9 +102,9 @@ class KnownAuthors:
                           "fix {self.file_path} and run again"
                     raise ValueError(msg)
         logging.log(LOGLEVEL, f"In file {self.file_path} found " +
-                     f"{len(self.is_next)} confirmed NExT authors, " +
-                     f"{len(self.maybe_next)} possible NExT authors, " +
-                     f"{len(self.not_next)} non-NExT authors, ")
+                    f"{len(self.is_next)} confirmed NExT authors, " +
+                    f"{len(self.maybe_next)} possible NExT authors, " +
+                    f"{len(self.not_next)} non-NExT authors, ")
 
     def save(self):
         """Write the authors to disk """
@@ -165,7 +126,7 @@ class KnownAuthors:
         """We only use a name becuase no other field is garenteed to be consistant
         Overscanning shouldn't be too much of an issue"""
         membership = membership.lower()
-        initial, last = get_initial_last(name)
+        initial, last = latex_bib.get_initial_last(name)
         name = f"{initial}. {last}" if initial is not None else last
         # remove it from maybe
         if "no" in membership:
@@ -227,49 +188,37 @@ def xml_entry_to_bib(xml_entry):
             # this information appears to be a mix of
             # journal, pages and volume
             bib_fields["journal"] = part.text
-    bib_persons = {'author': [pybtex.database.Person(author)
-                              for author in authors]}
-    bib_entry = pybtex.database.Entry("paper", bib_fields, bib_persons)
+    bib_fields["author"] = ' and '.join(authors)
+    bib_entry = latex_bib.BibEntry(bib_fields, entry_type="article")
     return bib_entry, last_update, authors
-
-
-def make_bib_key(bib_entry):
-    fields = bib_entry.fields
-    author = bib_entry.persons['author'][0].last()[-1]
-    if author.lower() == "collaboration":
-        author = bib_entry.persons['author'][0].first()[-1]
-    author = ''.join(list(filter(lambda c: c.isalpha(), author)))
-    #title = ''.join(list(filter(lambda c: c.isalpha(), fields['title'])))
-    key = f'{author}:{fields["year"]}:{fields["eprint"]}'
-    return key
 
 
 class KnownPapers:
     """Keep track of papers we have found """
     def __init__(self, file_is_next, file_not_next):
         self.file_is_next, self.is_next, self.ids_is_next = \
-                self.__setup(file_is_next)
-        logging.log(LOGLEVEL, f"In {file_is_next} found {len(self.is_next.entries)} items")
+            self.__setup(file_is_next)
+        logging.log(LOGLEVEL, f"In {file_is_next} found {len(self.is_next)} items")
         self.file_not_next, self.not_next, self.ids_not_next = \
-                self.__setup(file_not_next)
-        logging.log(LOGLEVEL, f"In {file_not_next} found {len(self.not_next.entries)} items")
+            self.__setup(file_not_next)
+        logging.log(LOGLEVEL, f"In {file_not_next} found {len(self.not_next)} items")
 
     def __setup(self, file_path):
         assert file_path.endswith(".bib"),\
                 f"Expected a '.bib' file, found {file_path}"
         ids = {}  # key is arxiv id, value is bib key
         if os.path.exists(file_path):
-            bib_data = pybtex.database.parse_file(file_path)
-            for key, entry in bib_data.entries.items():
+            bib_data = latex_bib.Bibliography(file_path)
+            for key, entry in bib_data.items():
                 arxiv_id = entry.fields['eprint'].split('v')[0]
                 ids[arxiv_id] = key
         else:
-            bib_data = pybtex.database.BibliographyData()
+            bib_data = latex_bib.Bibliography()
         return file_path, bib_data, ids
 
     def save(self):
-        self.is_next.to_file(self.file_is_next)
-        self.not_next.to_file(self.file_not_next)
+        self.is_next.save(self.file_is_next)
+        self.not_next.save(self.file_not_next)
         logging.log(LOGLEVEL, f"Written bibs to {self.file_is_next} and {self.file_not_next}")
 
     def update_paper(self, arxiv_id, new_entry, in_next):
@@ -280,13 +229,13 @@ class KnownPapers:
         else:
             bib_object = self.not_next
             key = self.ids_not_next[arxiv_id]
-        existing_date = bib_object.entries[key].fields["last_update"]
+        existing_date = bib_object[key].fields["last_update"]
         existing_date = datetime.fromisoformat(existing_date)
         new_date = new_entry.fields["last_update"]
         new_date = datetime.fromisoformat(new_date)
         if new_date > existing_date:
             logging.log(LOGLEVEL, f"Found update for {arxiv_id}")
-            bib_object.entries[key] = new_entry
+            bib_object[key] = new_entry
 
     def add_paper(self, bib_entry):
         arxiv_id = bib_entry.fields['eprint'].split('v')[0]
@@ -307,22 +256,21 @@ class KnownPapers:
                 logging.warning(f"Unknown error in PDF {arxiv_id}")
                 logging.warning(str(e))
                 return False
-            key = make_bib_key(bib_entry)
             if next_paper:
                 logging.log(LOGLEVEL, f"Added {arxiv_id} as NExT")
-                self.ids_is_next[arxiv_id] = key
-                self.is_next.add_entry(key, bib_entry)
+                self.ids_is_next[arxiv_id] = bib_entry.key
+                self.is_next.add_entry(bib_entry)
             else:
                 logging.log(LOGLEVEL, f"{arxiv_id} is not NExT")
-                self.ids_not_next[arxiv_id] = key
-                self.not_next.add_entry(key, bib_entry)
+                self.ids_not_next[arxiv_id] = bib_entry.key
+                self.not_next.add_entry(bib_entry)
         return next_paper
 
 
 def check_author_name(known_papers, known_authors, author, start_date):
     # author names tend to be given "first last"
     # for a search string we need last,&first
-    initial, last = get_initial_last(author)
+    initial, last = latex_bib.get_initial_last(author)
     author = f"{last},&{initial}" if initial is not None else last
     query = f"http://export.arxiv.org/api/query?search_query=au:{author}&sortBy=lastUpdatedDate&sortOrder=descending&start="
     page = 0
@@ -330,7 +278,7 @@ def check_author_name(known_papers, known_authors, author, start_date):
     patience = 3
     page_without_next = 0 
     while page_without_next < patience:
-        xml_string = request_url(query + str(page))
+        xml_string = tools.request_url(query + str(page))
         xml_tree = xml.etree.ElementTree.fromstring(xml_string)
         page_without_next += 1
         has_entry = False
@@ -399,62 +347,3 @@ def check_for_papers(prefix="./"):
     known_authors.save()
     logging.log(LOGLEVEL, "Done")
 
-
-#if __name__ == "__main__":
-#    check_for_papers()
-
-## don't use these..... arXiv robot.txt forbits downloading e-prints.
-#import gzip
-#import tarfile
-#import zipfile
-#
-#def unpack_tex_from_tar(byte_tar):
-#    """Given a bytestring representing a tar containing tex files,
-#    return the texfiles as bytestring"""
-#    io_bytes = io.BytesIO(byte_tar)
-#    tar_file = tarfile.open(fileobj=io_bytes, mode='r')
-#    members = tar_file.getmembers()
-#    data = b""
-#    for member in members:
-#        if member.name.endswith(".tex"):
-#            with tar_file.extractfile(member) as file_obj:
-#                if file_obj is not None:
-#                    data += file_obj.read()
-#    return data
-#
-#
-#def unpack_tex_from_zip(byte_zip):
-#    """Given a bytestring representing a zip containing tex files,
-#    return the texfiles as bytestring"""
-#    io_bytes = io.BytesIO(byte_zip)
-#    zip_file = zipfile.ZipFile(io_bytes, mode='r')
-#    members = zip_file.namelist()
-#    data = b""
-#    for member in members:
-#        if member.endswith(".tex"):
-#            with zip_file.open(member) as file_obj:
-#                data += file_obj.read()
-#    return data
-#
-#
-#def get_paper_tex(arxiv_id):
-#    """Get the tex files in a paper"""
-#    url = "http://arxiv.org/e-print/" + arxiv_id
-#    data = urllib.request.urlopen(url).read()
-#    try:
-#        data = gzip.decompress(data)
-#        print("Was gzipped")
-#    except OSError:
-#        pass  # not a gzip
-#    try:
-#        data = unpack_tex_from_tar(data)
-#        print("Was tar")
-#    except tarfile.ReadError:
-#        pass  # not a tar
-#    try:
-#        data = unpack_tex_from_zip(data)
-#        print("Was zip")
-#    except zipfile.BadZipFile:
-#        pass  # not a zip
-#    return data
-#
