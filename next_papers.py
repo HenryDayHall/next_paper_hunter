@@ -241,8 +241,8 @@ class KnownPapers:
         new_date = datetime.fromisoformat(new_date)
         if new_date > existing_date:
             logging.log(LOGLEVEL, f"Found update for {arxiv_id}")
-            bib_object.change_key(key, new_entry.key)
-            bib_object[new_entry.key] = new_entry
+            new_entry.key = key  # don't change the key
+            bib_object[key] = new_entry
 
     def add_paper(self, bib_entry):
         arxiv_id = bib_entry.fields['eprint'].split('v')[0]
@@ -283,7 +283,7 @@ def check_author_name(known_papers, known_authors, author, start_date):
     page = 0
     # willing to check 3 pages of results before giving up on this author
     patience = 3
-    page_without_next = 0 
+    page_without_next = 0
     while page_without_next < patience:
         xml_string = tools.request_url(query + str(page))
         xml_tree = xml.etree.ElementTree.fromstring(xml_string)
